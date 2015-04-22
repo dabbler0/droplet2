@@ -1,509 +1,428 @@
+helper = require './helper.coffee'
 {SplayList} = require 'splaylist'
-{Stack} = require './helper.coffee'
 
-###
-BASIC ARCHITECTURE NOTES:
-```
-Context
-   |
-   V
-DropletList
-   |
-   V
-Data types
-```
-
-**Context**
-Cleanly deals with Droplet mutations. Keeps an undo stack
-and has the concept of a cursor.
-
-**DropletList**
-Deals with locating and getting locations for data elements, and
-makes sure that parent is good at construction time (parenting is not
-guaranteed after mutations; that is Context's responsibility).
-
-**Data types**
-These do not mutate themselves. They contain static information about
-the document and its markup.
-###
-
-###
-Context
-###
-
-# # Context
-# An editing context for a Droplet document
+# THE LAYERS
 #
-# A context contains:
-#   - A document
-#   - An undo stack
-#   - A cursor
-#
-# A context knows how to:
-#   - Do splices with proper whitespace, undo stack management, and reparenting
-#   - Undo and redo
-#   - Move the cursor properly
-exports.Context = class Context
-  constructor: ->
-    @list = new DropletList()
-    @undoStack = new Stack()
-    @redoStack = new Stack()
-    @cursor = {
-      row: 0
-      char: 0
-      n: 0
+# Context -- deals with the undo stack and whitespace management
+# Segment -- deals with parenting and interfaces locations
+# List -- underlying data structure connecting Tokens
+# Nodes -- Droplet tree containing Tokens
+# Tokens -- immutable data
+
+# ## Context
+# A Context is what other modules with interact with.
+class Context
+  constructor: (@document) ->
+    @undoStack = new helper.Stack()
+    @redoStack = new helper.Stack()
+
+  record: (operation) ->
+    @undoStack.push operation
+    @redoStack.clear()
+
+  # ### Insert
+  # Inserts the given list _after_ the given location token, and logs
+  # an undo operation about it.
+  # ```
+  # A A A A A
+  #     ^ B B B
+  # A A A B B B A A
+  # ```
+  insert: (location, list) ->
+    @document.insert location, list
+    @record {
+      type: 'insert'
+
+      insertLocation: @document.get(location).locate()
+      list: list.clone()
+
+      startLocation: list.first().locate()
+      endLocation: list.last().locate()
     }
 
-  push: (token) -> @list.push token
+  # ### Remove
+  # Removes the given start location and end location, inclusive, and logs
+  # an undo operation about it. Returns the removed list.
+  # ```
+  # A B C D E F G
+  #     ^     ^
+  # Becomes A B G
+  # Returns C D E F
+  # ```
+  remove: (startLocation, endLocation) ->
+    reinsertLocation = @document.get(startLocation).prev().locate()
+    removed = @document.remove startLocation, endLocation
+    @record {
+      type: 'remove'
 
-  validateRemovalSegment: (startLoc, endLoc) -> startLoc.val().parent is endLoc.val().parent
+      startLocation: startLocation
+      endLocation: endLocation
 
-  # ## remove and insert
-  # Raw changes with undo logs
-  remove: (start, end) ->
-    # Clear the redo stack
-    unless @redoStack.empty
-      @redoStack = new Stack()
+      insertLocation: reinsertLocation
+      list: removed.clone()
+    }
 
-    # Validate the selection. A selection
-    # must be at only one tree level to be removed.
-    startLoc = @list.locate start
-    endLoc = @list.locate end
-
-    startLocation = @list.location startLoc
-    endLocation = @list.location endLoc.next()
-
-    unless @validateRemovalSegment startLoc, endLoc
-      throw new RangeError 'Attempted to remove an illegal segment'
-
-    # Remove and remember the segment.
-    # spliceList includes first but not last; our convention is
-    # to include last but not first, so we need to shift everything
-    # by one.
-    segment = @list.spliceList(startLoc.next(), endLoc.next(), null)
-
-    # Deparent the segment
-    segment.setParent null
-
-    # Add an undo operation
-    @undoStack.push new RemoveOperation startLocation, segment.clone(), endLocation
-
-    # Return the removed segment
-    return segment
-
-  insert: (start, segment) ->
-    unless segment instanceof DropletList
-      segment = new DropletList segment
-
-    # Clear the redo stack
-    unless @redoStack.empty
-      @redoStack = new Stack()
-
-    # Remember the last node for later location retrieval
-    lastNode = segment.last()
-
-    # Enparent the segment
-    segment.setParent start.parent
-
-    # Insert the segment
-    @list.spliceList start, 0, segment
-
-    # Add the undo operation
-    @stack.push new InsertOperation start, segment.clone(), @list.location(lastNode)
-
-    return null
-
-  # ## cleanRemove and cleanInsert
-  # These deal with whitespace. As a rule, when doing normal editing,
-  # we always remove all whitespace preceding a segment,
-  # and insert one newline where necessary.
-  #
-  # Additionally, for convenience, cleanRemove is inclusive.
-  cleanRemove: (start, end) ->
-    startLoc = @list.locate start
-    endLoc = @list.locate end
-
-    # Back up to swallow all whitespace before our first token
-    while startLoc.prev().val().isNewline
-      startLoc = startLoc.prev()
-
-    # Raw remove is not inclusive, so back up one more
-    startLoc = startLoc.prev()
-
-    # Actually remove
-    removedSegment = @remove startLoc, end
-
-    # Make sure that we never leave an empty indent;
-    # if the indent is now empty, insert a newline token.
-    if startLoc.next().val() is startLoc.val().container?.end and
-        startLoc.val().container instanceof Indent
-      @insert startLoc, [new NewlineToken()]
-
-    return removedSegment
-
-  cleanInsert: (start, segment) ->
-    startLoc = @list.locate start
-    startToken = startLoc.val()
-
-    # Insert a newline if necessary. This is necessary
-    # if there is not already a newline there, and we
-    # are inserting into something with an indent
-    # as a parent.
-    unless startToken.isNewline or
-        (not startToken.parent instanceof Indent) or
-        segment.first().val().isNewline
-      segment.unshift new NewlineToken()
-
-    # The do the raw insert
-    @insert start, segment
-
-  # ## undo and redo
-  # Pop from the undo/redo stacks
-  # and perform the operations
+  # Undo
   undo: ->
-    unless @undoStack.empty
-      operation = @undoStack.pop()
-      @opBackward operation
-      @redoStack.push operation
+    operation = @undoStack.pop()
 
+    if operation.type is 'remove'
+      place = @document.get(operation.startLocation).prev().handle
+      @document.insert place, operation.list.clone()
+    else if operation.type is 'insert'
+      @document.remove operation.startLocation, operation.endLocation
+
+    @redoStack.push operation
+
+  # Redo
   redo: ->
-    unless @redoStack.empty
-      operation = @redoStack.pop()
-      @opForward operation
-      @undoStack.push operation
+    operation = @undoStack.pop()
 
-  # ## opForward and opBackward
-  # Perform InsertOperations and RemoveOperations
-  opForward: (operation) ->
-    if operation instanceof InsertOperation
-      @list.spliceList operation.start, 0, operation.segment
-    else if operation instanceof RemoveOperation
-      @list.spliceList operation.start.next(), operation.end.next(), null
+    if operation.type is 'remove'
+      @document.remove operation.startLocation, operation.endLocation
+    else if operation.type is 'insert'
+      @document.insert operation.startLocation, operation.list.clone()
 
-  opBackward: (operation) ->
-    if operation instanceof InsertOperation
-      @list.spliceList operation.start.next(), operation.end.next(), null
-    else if operation instanceof RemoveOperation
-      @list.spliceList @list.locate(operation.start), 0, operation.segment
+    @undoStack.push operation
 
-# # Undo Operations
-class Operation
-  constructor: ->
+  # Stringify
+  stringify: -> @document.stringify()
 
-class RemoveOperation extends Operation
-  constructor: (@start, @segment, @end) ->
+class DropletLocation
+  constructor: (
+    @row = 0
+    @col = 0
+    @type = null
+    @length = null
+  ) ->
 
-class InsertOperation extends Operation
-  constructor: (@start, @segment, @end) ->
-
-###
-DropletList
-###
-
-# # DropletLocation
-# Shell struct for a location object in Droplet.
-exports.DropletLocation = class DropletLocation
-  constructor: (@row, @col, @type, @length) ->
-
-# # DropletList
-# A subclass of SplayList which also knows
-# how to deal with the Droplet tree and location scheme.
+# ## Segment
+# A Segment is a list of DropletLeaf objects, which can
+# look them up by any of the order statistics:
+#   - string length
+#   - line number
+#   - number of tokens
 #
-# DropletList is responsible for:
-#   - location serialization and lookup
-#   - conversion from Droplet tree to a string
-#   - managing basic Droplet tree parenting
-class DropletList extends SplayList
-  constructor: (arr) ->
-    @_root = null
+# It can be spliced into or out of other Segments.
+#
+# TODO update this to a SplayList
+exports.Segment = class Segment
+  constructor: (@list = new DropletList()) ->
 
-    # Can construct from array
-    if arr?
-      @push el for el, i in arr
+  # TODO linked-list stub
+  get: (location) ->
+    if location instanceof DropletHandle
+      return location.data
 
-  spliceList: (first, limit, insert) ->
-    super first, limit, insert, new DropletList()
+    head = @list.first(); row = (if head instanceof NewlineToken then 1 else 0)
 
-  # Override "push" to properly do Droplet
-  # parent tree
-  push: (node) ->
-    node.parent ?= @last()?.parent
-    if node instanceof StartToken
-      node.container.parent = node.parent
-    super node
+    until row is location.row
+      head = head.next()
+      if head instanceof NewlineToken
+        row += 1
 
-  # Droplet stringify
-  stringify: (start = @first(), end = @last()) ->
-    string = ''
-    indent = ''
-    until start is end
-      tok = start.val()
-      switch tok.type
-        when 'text'
-          string += tok.value
-        when 'newline'
-          string += '\n' + (tok.special ? indent)
-        when 'start:indent'
-          indent += tok.container.prefix
-        when 'end:indent'
-          indent = indent[...-tok.container.prefix.length]
-      start = start.next()
-    return string
+    if head instanceof NewlineToken
+      col = head.stringify().length - 1
+    else
+      col = head.stringify().length
 
-  # ## setParent
-  # Set the parent of everything at the root level of this segment.
-  setParent: (parent) ->
-    # Iterate from start to end
-    head = @first()
-    tail = @last()
-    until head is tail or head is null
-      console.log @stat('n', head), @stat('n', tail)
-      tok = head.val()
+    until col >= location.col
+      head = head.next()
+      col += head.stringify().length
 
-      # If the token we're at is the start of
-      # a container, set the container parent and
-      # skip to the end of the container
-      # instead.
-      #
-      # We do not set any parents of start tokens of containers,
-      # because those parents are always the containers themselves
-      # and will not change if this segment is splice in somewhere.
-      if tok instanceof StartToken
-        tok = tok.container.end
-        tok.container.parent = parent
-        head = tok.loc
-
-      # Set the parent of whatever token we landed on.
-      tok.parent = parent
+    # If _we_ were the one who made the length equal,
+    # move over; locations always refer to the _start_ of the token.
+    if col is location.col and head.stringify().length > 0
       head = head.next()
 
-    tail.val().parent = parent
-
-  # ## clone
-  clone: ->
-    clone = new DropletList()
-
-    # Stack to keep track of cloned container objects
-    stack = []
-
-    @each (loc) ->
-      tok = loc.val()
-
-      # When we clone a start token, create a corresponding
-      # end token and add it to the stack,
-      # so that end tokens can match up with corresponding
-      # start tokens when popped.
-      if tok instanceof StartToken
-        container = tok.container.clone()
-        clone.push container.start
-        stack.push container.end
-
-      # Instead of cloning an end token, just pop from the stack
-      else if tok instanceof EndToken
-        clone.push stack.pop()
-
-      # Everything else is simple.
-      else
-        clone.push tok.clone()
-
-    return clone
-
-  # ## orderstats
-  # Standard SplayList orderstats override to count
-  # string length and newlines.
-  orderstats: (V, X, L, R) ->
-    # Init to V's values
-    n = 1
-    strlen = V.getStringRepresentation().length # TODO this is not used.
-    newlines = (if V.isNewline then 1 else 0)
-
-    # Add L and R
-    if L isnt null
-      n += L.n; strlen += L.strlen; newlines += L.newlines
-    if R isnt null
-      n += R.n; strlen += R.strlen; newlines += R.newlines
-
-    # Store in X
-    X.n = n; X.strlen = strlen; X.newlines = newlines
-
-  # ## locate
-  # Given a Droplet location object:
-  # {
-  #   row: int
-  #   col: int
-  #   length: int # length of string representation
-  #   type: str # type of token
-  # }
-  # Find the corresponding token.
-  locate: (location) ->
-    if location instanceof SplayList.Location
-      return location
-
-    else if location instanceof DropletLocation
-      # Get to the row
-      head = @find 'newlines', location.row
-
-      # Advance until column condition is fulfilled
-      length = head.val().getStringRepresentation().length
-      head = head.next()
-      until length >= location.col or
-            head.val().isNewline
-        length += head.val().getStringRepresentation().length
+    if location.length?
+      until (head.container ? head).stringify().length is location.length
         head = head.next()
 
-      # Advance until length and type conditions are fulfilled.
-      # We may be looking for a start/end token for a
-      # container of a certain length
-      if location.length? and (/(start|end).*/.exec(location.type)?)
-        until head.val().type is location.type and
-            @stringify(head, head.val().conatiner.end.loc).length is location.length
-          head = head.next()
+    if location.type?
+      until head.type is location.type
+        head = head.next()
 
-      # Or we may be looking for a text/newline token with a certain length
-      else if location.length?
-        until head.val().getStringRepresentation().length is location.length
-          head = head.next()
+    return head
 
-      # Or we may not have length info
-      else
-        until head.val().type is location.type or
-              head.val().isNewline
-          head = head.next()
-      return head
+  # TODO linked-list stub
+  insert: (location, segment) ->
+    token = @get(location)
+
+    if token instanceof StartToken
+      segment.setParent token.container
     else
-      throw new RangeError location + ' is not a location'
+      segment.setParent token.parent
 
-  location: (node) ->
-    row = @stat('newlines', node) - 1
+    handle = token.handle
+    @list.insert(handle, segment.list)
 
-    # Find the starting newline of this line
-    # and see how many characters away we are
-    # from it.
-    head = @find('newlines', row)
-    col = head.val().getStringRepresentation().length # (include indent)
-    until head is node
-      head = head.next()
-      col += head.val().getStringRepresentation().length
+  # TODO linked-list stub
+  remove: (startLocation, endLocation) ->
+    start = @get(startLocation)
+    end = @get(endLocation)
 
-    type = node.val().type
+    # Make sure the tree is still valid
+    if start.parent isnt end.parent
+      throw new RangeError 'Attempted to remove an invalidly parented segment'
 
-    # Get the string representation of this node length
-    if /(start|end).*/.exec(node.val().type)?
-      container = node.val().container
-      length = @stringify(container.start.loc, container.end.loc)#.length
-    else
-      length = node.val().getStringRepresentation().length
+    startHandle = start.handle
+    endHandle = end.handle
 
-    # Return all this info.
-    return new DropletLocation row, col, type, length # TODO as above
+    result = new Segment(@list.remove(startHandle, endHandle))
+    result.setParent null
 
-# # IdObject
-# Simple class for assign object ids
-class IdObject
-  constructor: ->
-    @id = IdObject.id++
+    return result
 
-IdObject.id = 0
-
-# # The Data Objects
-# These are the elements of the Droplet tree and the data
-# that is stored in the DropletList. They hold info on the
-# actual content of the document and its markup.
-#
-# As a rule, these classes should not have mutator functions, nor
-# should their data ever change after parse-time.
-
-exports.DropletNode = class DropletNode extends IdObject
-  constructor: ->
-    @parent = null
-
-# ## Container
-# A Container is not attached to a location, instead
-# pointing to two different nodes which are its start and end.
-#
-# A Container can have children in the Droplet tree.
-exports.Container = class Container extends DropletNode
-  constructor: (@type = 'container')->
-    super
-
-    @start = new StartToken @
-    @start.type += ':' + @type
-
-    @end = new EndToken @
-    @end.type += ':' + @type
-
-# ### The types of containers
-exports.Indent = class Indent extends Container
-  constructor: (@prefix) ->
-    super 'indent'
-
-  clone: -> new Indent @prefix
-
-exports.Block = class Block extends Container
-  constructor: (@lotsofargs) -> # TODO arguments
-    super 'block'
-
-  clone: -> new Block @lotsofargs
-
-exports.Socket = class Socket extends Container
-  constructor: (@lotsofargs) -> # TODO arguments
-    super 'socket'
-
-  clone: -> new Socket @lotsofargs
-
-# ## Token
-# A Token is a piece of data attached to a location.
-# Tokens cannot have children.
-exports.Token = class Token extends DropletNode
-  constructor: ->
-    super
-    @location = null
-
-  # ### getIndent
-  # Travel up the parent tree to find
-  # what the indent prefix should be on the line on
-  # which this token is.
-  getIndent: ->
-    head = @; indent = ''
+  # TODO linked-list stub
+  shallowEach: (fn) ->
+    head = @list.first()
     while head?
-      if head instanceof Indent
-        indent += head.prefix
-      head = head.parent
-    return indent
+      if head instanceof StartToken
+        fn head.container
+        head = head.container.end
+      else
+        fn head
+        head = head.next()
 
-  getStringRepresentation: -> ''
+  deepEach: (fn) ->
+    head = @list.first()
+    while head?
+      fn head
+      head = head.next()
 
-# ## The types of tokens
-# StartToken and EndToken, which have to do with Containers;
-# TextToken, which contains a string, and NewlineToken, which contains
-# a newline and possibly some whitespace.
-exports.StartToken = class StartToken extends Token
+  # TODO linked-list stub
+  clone: ->
+    stack = new helper.Stack()
+    list = new DropletList()
+    @deepEach (node) ->
+      if node instanceof StartToken
+        container = node.container.clone()
+        container.setParent stack.top()
+        list.append container.start
+        stack.push container
+      else if node instanceof EndToken
+        list.append stack.pop().end
+      else
+        clone = node.clone()
+        clone.setParent stack.top()
+        list.append clone
+    return new Segment list
+
+  stringify: ->
+    string = ''
+    @deepEach (node) ->
+      string += node.stringify()
+    return string
+
+  setParent: (parent) ->
+    @shallowEach (node) ->
+      node.setParent parent
+
+  serialize: -> "{#{@list.serialize()}}"
+
+  first: -> @list.first()
+  last: -> @list.last()
+
+  append: (token) ->
+    last = @last()
+    if last? and not (token instanceof EndToken)
+
+      if last instanceof StartToken
+        parent = last.container
+      else
+        parent = last.parent
+
+      if token instanceof StartToken
+        token.container.setParent parent
+      else
+        token.setParent parent
+
+    else
+      token.parent = null
+    @list.append token
+
+class DropletList
+  constructor: (@head = null, @tail = null) ->
+
+  insert: (handle, list) ->
+    handle.next.prev = list.tail; list.tail.next = handle.next
+    handle.next = list.head; list.head.prev = handle
+
+  remove: (startHandle, endHandle) ->
+    if startHandle.prev?
+      startHandle.prev.next = endHandle.next
+    if endHandle.next?
+      endHandle.next.prev = startHandle.prev
+
+    startHandle.prev = endHandle.next = null
+
+    result = new DropletList(startHandle, endHandle)
+
+  append: (data) ->
+    if data instanceof DropletList
+      if @head is @tail is null
+        @head = data.head; @tail = data.tail
+      else
+        @tail.next = data.head; data.head.prev = @tail
+        @tail = data.tail
+    else
+      if @head is @tail is null
+        @head = @tail = new DropletHandle data
+      else
+        handle = new DropletHandle data
+        @tail.next = handle; handle.prev = @tail
+        @tail = handle
+
+  first: -> @head?.data ? null
+  last: -> @tail?.data ? null
+
+  # Validate that this is indeed a linked list
+  valid: ->
+    if @head.prev? or @tail.next?
+      return false
+
+    tortoise = @head
+    hare = @head.next
+
+    while tortoise?
+      # Check asymmetric linkage
+      if tortoise.next? and tortoise.next.prev isnt tortoise
+        return false
+
+      tortoise = tortoise.next
+      if hare? then hare = hare.next
+      if hare? then hare = hare.next
+
+      # Check infinite loops (Floyd's cycle-finding algorithm)
+      if hare? and tortoise is hare
+        return false
+
+    return true
+
+  serialize: ->
+    head = @head; str = head.serialize()
+    until head is @tail
+      head = head.next
+      str += ',' + head.serialize()
+    return str
+
+class DropletHandle
+  constructor: (@data) ->
+    @data.handle = @
+    @prev = @next = null
+
+  locate: ->
+    location = new DropletLocation(); head = @.prev
+
+    location.type = @data.type
+    if @data instanceof StartToken
+      location.length = @data.container.stringify().length
+    else
+      location.length = @data.stringify().length
+
+    until (not head?) or head.data instanceof NewlineToken
+      location.col += head.data.stringify().length
+      head = head.prev
+    if head?
+      location.col += head.data.stringify().length - 1
+
+    while head?
+      if head.data instanceof NewlineToken
+        location.row += 1
+      head = head.prev
+
+    return location
+
+  serialize: -> '[' + @data.serialize() + ']'
+
+class Node
+  constructor: (@parent) ->
+
+  clone: ->
+
+  setParent: (parent) -> @parent = parent
+
+class Container extends Node
+  constructor: (@parent) ->
+    @start = new StartToken @
+    @end = new EndToken @
+    @_id = Container._id++
+
+  stringify: ->
+    head = @start
+    string = head.stringify()
+    until head is @end
+      head = head.next()
+      string += head.stringify()
+    return string
+
+  clone: -> new Container()
+
+  setParent: (@parent) ->
+    @start.parent = @end.parent = @parent
+
+  serialize: -> "Container(#{@_id})"
+
+Container._id = 0
+
+class Token extends Node
+  constructor: (@parent) ->
+
+  # All Leaf objects can traverse forward and backward
+  # like linked list elements; this may delegate to associated SplayList
+  # Location objects.
+  next: -> @handle.next?.data
+  prev: -> @handle.prev?.data
+
+  # TODO stub
+  getIndent: -> ''
+
+  stringify: -> ''
+
+  locate: -> @handle.locate()
+
+  serialize: -> 'Token'
+
+class StartToken extends Token
   constructor: (@container) ->
-    super
-    @parent = @container
-    @type = 'start'
-
-exports.EndToken = class EndToken extends Token
-  constructor: (@container) ->
-    super
     @parent = @container.parent
-    @type = 'end'
+    @type = 'StartToken'
 
-exports.TextToken = class TextToken extends Token
-  constructor: (@value) ->
-    @super
-    @isText = true
-    @type = 'text'
+  serialize: -> "StartToken(#{@container._id})"
+
+class EndToken extends Token
+  constructor: (@container) ->
+    @parent = @container.parent
+    @type = 'EndToken'
+
+  serialize: -> "EndToken(#{@container._id})"
+
+class TextToken extends Token
+  constructor: (@value, @parent = null) ->
+    @type = 'TextToken'
+
+  stringify: -> @value
 
   clone: -> new TextToken @value
 
-  getStringRepresentation: -> @value
+  serialize: -> "TextToken(#{@value})"
 
-exports.NewlineToken = class NewlineToken extends Token
-  constructor: (@special = null) ->
-    @isNewline = true
-    @type = 'newline'
+class NewlineToken extends Token
+  constructor: (@specialIndent = null, @parent = null) ->
+    type = 'NewlineToken'
 
-  clone: -> new NewlineToken @special
+  stringify: -> '\n' + (@specialIndent ? @getIndent())
 
-  getStringRepresentation: -> '\n' + (@special ? @getIndent())
+  clone: -> new NewlineToken @specialIndent
+
+  serialize: -> "NewlineToken(#{@specialIndent ? ''})"
+
+exports.Context = Context
+exports.Segment = Segment
+exports.Location = DropletLocation
+
+exports.tokens = {Token, TextToken, NewlineToken}
+exports.containers = {Container}
+
+exports.__internals = {DropletList, Node}

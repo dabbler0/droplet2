@@ -11,12 +11,14 @@
   "dependencies": {
     "browserify": "^9.0.8",
     "caching-coffeeify": "^0.5.0",
+    "coffee-script": "^1.9.2",
     "gulp": "^3.8.11",
     "gulp-docco": "0.0.4",
     "gulp-rename": "^1.2.2",
     "gulp-sourcemaps": "^1.5.2",
     "gulp-spawn-mocha": "^2.0.1",
     "gulp-uglify": "^1.2.0",
+    "splaylist": "0.0.0",
     "through2": "^0.6.5"
   }
 }

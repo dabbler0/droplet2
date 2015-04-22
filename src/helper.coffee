@@ -1,19 +1,24 @@
-# # Stack
-# Simple stack implementation
-class StackNode
-  constructor: (@data, @next) ->
-
 exports.Stack = class Stack
   constructor: ->
-    @empty = true
     @head = null
 
-  push: (data) ->
-    @head = new StackNode data, @head
-    @empty = false
+  top: ->
+    if @head?
+      return @head.data
+    else
+      return null
 
   pop: ->
-    data = @head.data
-    @head = @head.next
-    @empty = (@head is null)
-    return data
+    if @head?
+      result = @head.data
+      @head = @head.next
+      return result
+    else
+      return null
+
+  push: (data) ->
+    @head = {data, next: @head}
+    return true
+
+  clear: ->
+    @head = null
